@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import {
   CheckoutPaymentIntent,
   Client,
@@ -7,20 +7,23 @@ import {
   OrderApplicationContextLandingPage,
   OrderApplicationContextUserAction,
   OrdersController,
-  PaypalPaymentTokenUsageType,
 } from '@paypal/paypal-server-sdk';
-import { envs } from 'src/config';
+import { envs, NATS_SERVICE } from 'src/config';
 import { PaymentSessionDto } from './dto/payment-session.dto';
 import { Request, Response } from 'express';
+import { ClientProxy } from '@nestjs/microservices';
+import { PaypalClient } from 'src/services/paypal/paypal.client';
+import { PaypalService } from 'src/services/paypal/paypal.service';
 
 @Injectable()
 export class PaymentsService {
-  private readonly paypalClient = new Client({
-    clientCredentialsAuthCredentials: {
-      oAuthClientId: envs.paypalClientId,
-      oAuthClientSecret: envs.paypalSecret,
-    },
-  });
+  private readonly logger = new Logger('PaymentService');
+
+  constructor(
+    @Inject(NATS_SERVICE) private readonly client: ClientProxy,
+    private readonly paypalClient: PaypalClient,
+    private readonly paypalService: PaypalService,
+  ) {}
 
   async createPaymentSession(paymentSessionDto: PaymentSessionDto) {
     const { currency, items, orderId } = paymentSessionDto;
@@ -74,7 +77,13 @@ export class PaymentsService {
         },
       });
 
-      return response.result;
+      // return response.result.links;
+
+      return {
+        cancelUrl: envs.paypalCancelUrl,
+        successUrl: envs.paypalSuccessUrl,
+        url: response.result.links.find((link) => link.rel === 'approve').href,
+      };
     } catch (error) {
       console.error(error);
     }
@@ -86,7 +95,7 @@ export class PaymentsService {
       id: token,
     });
 
-    console.log('Success Result', response.result);
+    // console.log('Success Result', response.result);
 
     // return response.result;
     return {
@@ -106,15 +115,29 @@ export class PaymentsService {
     const sig = headers['paypal-transmission-sig'];
 
     try {
-      const isValid = await this.verifySignature(event, headers);
+      const isValid = await this.paypalService.verifySignature(event, headers);
 
       if (!isValid) return res.status(400).send('Invalid Signature');
 
       switch (event.event_type) {
         case 'PAYMENT.CAPTURE.COMPLETED':
           const chargeSucceeded = event;
+
+          const paymentData = await this.paypalService.getPaymentDetail(
+            chargeSucceeded.resource.id,
+          );
+
+          const payload = {
+            paypalPaymentId: chargeSucceeded.id,
+            orderId: chargeSucceeded.resource.custom_id,
+            receiptUrl: null,
+            receiptData: paymentData,
+          };
+
+          this.client.emit('payment.succeeded', payload);
+
           // PAYPAL No cuenta con un campo customizado para METADATA
-          console.log({ customId: chargeSucceeded.resource.custom_id });
+          // console.log({ customId: chargeSucceeded.resource.custom_id });
           break;
         default:
           console.log(`Event ${event.event_type} not handled`);
@@ -123,59 +146,6 @@ export class PaymentsService {
       return res.status(200).json({ sig });
     } catch (error) {
       return res.status(500).send(`Webhook Error: ${error.message}`);
-    }
-  }
-
-  async verifySignature(event, headers) {
-    this.paypalClient.getRequestBuilderFactory();
-    const transmissionId = headers['paypal-transmission-id'];
-    const sig = headers['paypal-transmission-sig'];
-    const timeStamp = headers['paypal-transmission-time'];
-    const certUrl = headers['paypal-cert-url'];
-    const authAlgo = headers['paypal-auth-algo'];
-
-    const body = {
-      auth_algo: authAlgo,
-      cert_url: certUrl,
-      transmission_id: transmissionId,
-      transmission_sig: sig,
-      transmission_time: timeStamp,
-      webhook_id: envs.paypalWebhookId,
-      webhook_event: event,
-    };
-
-    const oAuthAuthorizationController = new OAuthAuthorizationController(
-      this.paypalClient,
-    );
-
-    const auth = Buffer.from(
-      `${envs.paypalClientId}:${envs.paypalSecret}`,
-    ).toString('base64');
-
-    try {
-      const {
-        result: { accessToken },
-      } = await oAuthAuthorizationController.requestToken({
-        authorization: `Basic ${auth}`,
-      });
-
-      const response = await fetch(
-        `${envs.paypalApiUrl}${envs.paypalApiVerifyWebhookSignature}`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${accessToken}`,
-          },
-          body: JSON.stringify(body),
-        },
-      );
-
-      const data = await response.json();
-      return data.verification_status === 'SUCCESS';
-    } catch (error) {
-      console.error(`Webhook Error:`, error);
-      return false;
     }
   }
 }
